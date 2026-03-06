@@ -1,7 +1,7 @@
 """
-pipeline.py — Standalone voice demo (mic → STT → LLM → TTS → speaker)
-Unidirectional greeting flow: Listen → Delay → Respond → Play → Exit
-Uses Sarvam AI for STT/TTS, Aditya model for LLM via Groq.
+pipeline.py — Full voice ordering pipeline (STT → LLM → TTS with conversation memory)
+Low-latency, multi-turn voice ordering system for Mudigonda Sharma Cafe.
+Uses Sarvam AI for STT/TTS, Groq LLM for order processing and memory.
 """
 
 import os
@@ -14,12 +14,13 @@ import sounddevice as sd
 import wave
 if sys.platform == "win32":
     import winsound
-from main import groq_client, parse_response, SARVAM_KEY
+from main import groq_client, build_prompt, parse_response, SARVAM_KEY
 
 # ── Config ────────────────────────────────────────────────────────
 SAMPLE_RATE = 16000
 DURATION    = 5  # seconds to record
-RESPONSE_DELAY = 1.5  # seconds to wait before responding
+
+conversation_history = []  # Stores full conversation for context
 
 # ─────────────────────────────────────────────────────────────────
 # STEP 1 — STT: Record mic → text  (Sarvam Saarika)
@@ -55,44 +56,25 @@ def transcribe_audio(filename="input.wav"):
     return transcript
 
 # ─────────────────────────────────────────────────────────────────
-# STEP 2 — LLM: text → AI reply  (Groq + Aditya Model)
+# STEP 2 — LLM: text → AI reply  (Groq with conversation memory)
 # ─────────────────────────────────────────────────────────────────
-def get_llm_response(user_text):
-    """Generate a single, non-repetitive greeting response."""
-    print("Sending to Aditya LLM...")
+def get_llm_response(user_text, system_prompt):
+    """Process user input with full conversation history for order management."""
+    print("🤖 Processing with LLM...")
 
-    system_prompt = """You are Omkaar, a warm and welcoming waiter at Mudigonda Sharma Cafe, a South Indian restaurant.
-A customer has just greeted you. Respond with a single, engaging welcome monologue. Try to keep it concise. 
+    # Add user message to history
+    conversation_history.append({"role": "user", "content": user_text})
+    
+    # Prepare messages: system prompt + full history
+    messages = [{"role": "system", "content": system_prompt}] + conversation_history
 
-Your response should:
-1. Welcome them warmly in South Indian style (e.g., "Vanakam, Omkaar here from Mudigonda Sharma Cafe! How may I help you today?")
-2. Introduce the cafe briefly
-3. Mention a few signature items from the menu (Idlis, Dosas, Vadas, Coffee)
-4. Invite them to order
-5. Keep it natural, friendly, and under 4 seconds when spoken, and keep it short max 1-2 sentences.
-
-CRITICAL: 
-- Generate ONLY ONE response
-- Do NOT repeat yourself
-- Make it sound like a single, flowing speech
-- Be concise and friendly, speak till max 5-6 seconds of audio.
-
-Respond in STRICT JSON format only:
-{
-  "tts_message": "Your welcome message here"
-}"""
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Customer said: {user_text}"}
-    ]
-
-    # Use streaming to avoid token limit issues
+    # Call LLM with streaming (low latency)
+    start_time = time.time()
     completion = groq_client.chat.completions.create(
-        model="openai/gpt-oss-120b",  # Aditya equivalent via Groq
+        model="openai/gpt-oss-120b",
         messages=messages,
-        temperature=0.7,  # Lower temp for consistency
-        max_completion_tokens=512,  # Shorter max to avoid repetition
+        temperature=1,
+        max_completion_tokens=2048,  # Optimized for faster responses
         top_p=1,
         stream=True,
     )
@@ -103,28 +85,44 @@ Respond in STRICT JSON format only:
         if delta_content:
             full_reply += delta_content
 
-    # Parse the JSON response
-    try:
-        data = json.loads(full_reply.strip())
-        tts_message = data.get("tts_message", full_reply)
-    except json.JSONDecodeError:
-        # Fallback if JSON parsing fails
-        tts_message = full_reply
+    elapsed = time.time() - start_time
+    print(f"   ⚡ LLM response time: {elapsed:.2f}s")
 
-    # Display
-    print("\n" + "-" * 55)
-    print("  RESPONSE:")
-    print(f"  {tts_message}")
-    print("-" * 55)
+    # Add assistant response to history
+    conversation_history.append({"role": "assistant", "content": full_reply})
 
-    return tts_message
+    # Parse the structured response
+    data = parse_response(full_reply)
+    tts_message = data.get("tts_message", full_reply)
+    cart_status = data.get("cart_status", "shopping")
+    order_data = data.get("order_data", [])
+
+    # Display response details
+    print("\n" + "-" * 60)
+    print("  🧠 THOUGHT  :", data.get("thought_process", "-"))
+    print("  🗣️  SPEAK    :", tts_message[:100] + ("..." if len(tts_message) > 100 else ""))
+    print(f"  📍 STAGE    : {data.get('conversation_stage', '-')}  |  TONE: {data.get('ai_tone', '-')}")
+    
+    ca = data.get("customer_analysis", {})
+    print(f"  😊 MOOD     : {ca.get('sentiment', '-')}  |  RUSH: {ca.get('urgency', '-')}")
+    
+    if order_data:
+        items_str = ", ".join(f"{i.get('item_code')} x{i.get('qty')}" for i in order_data)
+        print(f"  🛒 CART     : {items_str}")
+    
+    print(f"  ✅ STATUS   : {data.get('cart_status', '-')}")
+    print("-" * 60)
+
+    return tts_message, cart_status, order_data, data
 
 # ─────────────────────────────────────────────────────────────────
-# STEP 3 — TTS: AI reply → speech  (Sarvam Aditya TTS)
+# STEP 3 — TTS: AI reply → speech  (Sarvam with low-latency playback)
 # ─────────────────────────────────────────────────────────────────
 def speak(text, filename="output.mp3"):
-    """Convert text to speech via Sarvam and play it."""
-    print("Sending to Sarvam TTS...")
+    """Convert text to speech and play immediately."""
+    print("🔊 Converting to speech...")
+    
+    start_time = time.time()
     headers = {
         "api-subscription-key": SARVAM_KEY,
         "Content-Type": "application/json",
@@ -132,9 +130,9 @@ def speak(text, filename="output.mp3"):
     payload = {
         "text": text,
         "target_language_code": "en-IN",
-        "speaker": "aditya",
-        "model": "bulbul:v3",
-        "pace": 1.4,
+        "speaker": "anushka",  # Use anushka for warm voice
+        "model": "bulbul:v2",
+        "pace": 1.0,
         "speech_sample_rate": 22050,
         "output_audio_codec": "mp3",
         "enable_preprocessing": True,
@@ -150,52 +148,60 @@ def speak(text, filename="output.mp3"):
                 if chunk:
                     f.write(chunk)
 
-    print(f"Audio saved: {filename}")
+    elapsed = time.time() - start_time
+    print(f"   ⚡ TTS generation time: {elapsed:.2f}s")
+    print(f"   ✓ Audio ready: {filename}")
 
-    # Play audio based on OS
+    # Play audio based on OS (blocking call)
     if sys.platform == "darwin":
         os.system(f"afplay {filename}")
     elif sys.platform == "win32":
-        # Use Windows default player (handles MP3 natively)
-        os.system(f"start {filename}")
+        # Windows: use default player (silent mode for minimal latency)
+        os.system(f"start /wait {filename}")
     else:
-        # Linux: try mpg123, fall back to ffplay
-        os.system(f"mpg123 {filename} 2>/dev/null || ffplay -nodisp -autoexit {filename}")
+        # Linux: mpg123 for quick playback
+        os.system(f"mpg123 -q {filename} 2>/dev/null || ffplay -nodisp -autoexit {filename}")
 
 # ─────────────────────────────────────────────────────────────────
-# MAIN PIPELINE (Single Turn Greeting Demo)
+# MAIN PIPELINE (Multi-turn voice ordering)
 # ─────────────────────────────────────────────────────────────────
 def run_pipeline():
-    """Unidirectional greeting flow: listen → delay → respond → play → exit"""
-    print("\n" + "=" * 55)
-    print("  Mudigonda Sharma Cafe — Voice Pipeline")
-    print("  Model: Aditya via Sarvam AI")
-    print("=" * 55)
+    """Multi-turn voice ordering: listen → LLM → speak → repeat until order closed"""
+    print("\n" + "=" * 60)
+    print("  Mudigonda Sharma Cafe — Voice Ordering Pipeline")
+    print("  Live STT → LLM → TTS with minimal latency")
+    print("=" * 60)
 
-    # Step 1: Record customer greeting
-    audio_file = record_audio()
-    transcript = transcribe_audio(audio_file)
+    conversation_history.clear()
+    system_prompt = build_prompt()
 
-    if not transcript.strip():
-        print("❌ Could not understand audio. Please try again.")
-        return
+    while True:
+        # Step 1: Record customer speech
+        audio_file = record_audio()
+        transcript = transcribe_audio(audio_file)
 
-    print(f"✓ Recognized: '{transcript}'")
+        if not transcript.strip():
+            print("❌ Could not understand. Please try again.\n")
+            continue
 
-    # Step 2: Wait for response delay
-    print(f"\n⏳ Processing... (waiting {RESPONSE_DELAY}s)")
-    time.sleep(RESPONSE_DELAY)
+        print(f"✓ Recognized: '{transcript}'\n")
 
-    # Step 3: Generate AI response (single, non-repetitive)
-    tts_message = get_llm_response(transcript)
+        # Step 2: Process with LLM + Step 3: Convert to speech
+        tts_message, cart_status, order_data, full_data = get_llm_response(transcript, system_prompt)
+        
+        # Step 4: Play audio response
+        speak(tts_message)
 
-    # Step 4: Convert to speech and play
-    speak(tts_message)
-
-    print("\n" + "=" * 55)
-    print("  ✓ Pipeline Complete")
-    print("=" * 55)
-    print("\nTo run again, restart the program.\n")
+        # Check if order is complete
+        if cart_status == "closed":
+            print("\n" + "=" * 60)
+            print("  ✅ ORDER CONFIRMED & CLOSED!")
+            print("=" * 60)
+            print(f"Order ID: {full_data.get('order_id', 'N/A')}")
+            print(f"Items: {json.dumps(order_data, indent=2, ensure_ascii=False)}")
+            print(f"Total: Rs.{full_data.get('order_total', 0)}")
+            print("=" * 60 + "\n")
+            break
 
 if __name__ == "__main__":
     run_pipeline()
