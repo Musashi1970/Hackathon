@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button"
 import { Menu, X } from "lucide-react"
 import { PetpoojaVaniLogo } from "@/components/petpooja-vani-logo"
 
-export function Navbar() {
+export function Navbar({ onSignIn }: { onSignIn?: () => void }) {
   const [mobileOpen, setMobileOpen] = useState(false)
 
   return (
@@ -30,17 +30,14 @@ export function Navbar() {
           <Link href="#integrations" className="text-sm font-medium text-muted-foreground transition-colors hover:text-foreground">
             Integrations
           </Link>
-          <Link href="/dashboard" className="text-sm font-medium text-muted-foreground transition-colors hover:text-foreground">
-            Dashboard
-          </Link>
         </nav>
 
         <div className="hidden items-center gap-3 md:flex">
-          <Button variant="ghost" size="sm" asChild>
-            <Link href="/dashboard">Sign In</Link>
+          <Button variant="ghost" size="sm" onClick={onSignIn}>
+            Sign In
           </Button>
-          <Button size="sm" className="bg-brand text-brand-foreground hover:bg-brand/90" asChild>
-            <Link href="/dashboard">Start Free Trial</Link>
+          <Button size="sm" className="bg-brand text-brand-foreground hover:bg-brand/90" onClick={onSignIn}>
+            Start Free Trial
           </Button>
         </div>
 
@@ -65,15 +62,12 @@ export function Navbar() {
             <Link href="#integrations" className="text-sm font-medium text-muted-foreground" onClick={() => setMobileOpen(false)}>
               Integrations
             </Link>
-            <Link href="/dashboard" className="text-sm font-medium text-muted-foreground" onClick={() => setMobileOpen(false)}>
-              Dashboard
-            </Link>
             <div className="flex flex-col gap-2 pt-2">
-              <Button variant="outline" size="sm" asChild>
-                <Link href="/dashboard">Sign In</Link>
+              <Button variant="outline" size="sm" onClick={() => { setMobileOpen(false); onSignIn?.() }}>
+                Sign In
               </Button>
-              <Button size="sm" className="bg-brand text-brand-foreground hover:bg-brand/90" asChild>
-                <Link href="/dashboard">Start Free Trial</Link>
+              <Button size="sm" className="bg-brand text-brand-foreground hover:bg-brand/90" onClick={() => { setMobileOpen(false); onSignIn?.() }}>
+                Start Free Trial
               </Button>
             </div>
           </nav>

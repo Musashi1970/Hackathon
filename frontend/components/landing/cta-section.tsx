@@ -1,8 +1,7 @@
-import Link from "next/link"
 import { Button } from "@/components/ui/button"
 import { ArrowRight, CalendarDays } from "lucide-react"
 
-export function CTASection() {
+export function CTASection({ onSignIn }: { onSignIn?: () => void }) {
   return (
     <section className="py-20 lg:py-32">
       <div className="mx-auto max-w-7xl px-6">
@@ -21,10 +20,8 @@ export function CTASection() {
               Join hundreds of restaurants already using Petpooja Vani to automate orders, optimize menus, and boost profits.
             </p>
             <div className="mt-10 flex flex-col items-center justify-center gap-4 sm:flex-row">
-              <Button size="lg" className="gap-2 px-8 bg-brand text-brand-foreground hover:bg-brand/90" asChild>
-                <Link href="/dashboard">
+              <Button size="lg" className="gap-2 px-8 bg-brand text-brand-foreground hover:bg-brand/90" onClick={onSignIn}>
                   Start Free Trial <ArrowRight className="h-4 w-4" />
-                </Link>
               </Button>
               <Button size="lg" variant="outline" className="gap-2 border-background/20 bg-transparent px-8 text-background hover:bg-background/10 hover:text-background">
                 <CalendarDays className="h-4 w-4" /> Book Demo

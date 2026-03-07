@@ -2,7 +2,7 @@ import Link from "next/link"
 import { Button } from "@/components/ui/button"
 import { ArrowRight, Bot, Play, Phone, Sparkles, TrendingUp, ShoppingCart } from "lucide-react"
 
-export function HeroSection() {
+export function HeroSection({ onSignIn }: { onSignIn?: () => void }) {
   return (
     <section className="relative overflow-hidden pt-32 pb-20 lg:pt-40 lg:pb-32">
       {/* Background decorative elements */}
@@ -32,10 +32,8 @@ export function HeroSection() {
 
           {/* CTA Buttons */}
           <div className="mt-10 flex flex-col items-center gap-4 sm:flex-row">
-            <Button size="lg" className="gap-2 px-8 bg-brand text-brand-foreground hover:bg-brand/90" asChild>
-              <Link href="/dashboard">
+            <Button size="lg" className="gap-2 px-8 bg-brand text-brand-foreground hover:bg-brand/90" onClick={onSignIn}>
                 Start Free Trial <ArrowRight className="h-4 w-4" />
-              </Link>
             </Button>
             <Button size="lg" variant="outline" className="gap-2 px-8">
               <Play className="h-4 w-4" /> Watch Demo

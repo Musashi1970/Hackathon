@@ -2,8 +2,9 @@
 
 import { useState, useEffect, useCallback } from "react"
 import Link from "next/link"
-import { usePathname } from "next/navigation"
+import { usePathname, useRouter } from "next/navigation"
 import { cn } from "@/lib/utils"
+import { isAuthenticated, clearAuthenticated } from "@/lib/auth"
 import {
   LayoutDashboard,
   ClipboardList,
@@ -217,14 +218,21 @@ const navSections: NavSection[] = [
 
 export function DashboardShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname()
+  const router = useRouter()
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [voiceAssistantActive, setVoiceAssistantActive] = useState(true)
   const [mounted, setMounted] = useState(false)
   const [searchOpen, setSearchOpen] = useState(false)
+  const [authChecked, setAuthChecked] = useState(false)
 
   useEffect(() => {
     setMounted(true)
-  }, [])
+    if (!isAuthenticated()) {
+      router.replace("/")
+    } else {
+      setAuthChecked(true)
+    }
+  }, [router])
 
   // Global search shortcut (Cmd+K)
   useEffect(() => {
@@ -247,6 +255,12 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
   }, [pathname])
 
   return (
+    <>
+    {!authChecked ? (
+      <div className="flex h-screen items-center justify-center bg-[#F8FAFC]">
+        <Loader2 className="h-8 w-8 animate-spin text-[#CF1F2E]" />
+      </div>
+    ) : (
     <div className="flex h-screen overflow-hidden bg-[#F8FAFC]" suppressHydrationWarning>
       {/* Mobile overlay */}
       {sidebarOpen && (
@@ -370,6 +384,16 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
                 <div className="text-xs text-[#6B7280]">Owner</div>
               </div>
             </div>
+
+            {/* Sign Out */}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-[#6B7280] hover:text-[#DC2626]"
+              onClick={() => { clearAuthenticated(); router.replace("/") }}
+            >
+              Sign Out
+            </Button>
           </div>
         </header>
 
@@ -417,5 +441,7 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
         </div>
       )}
     </div>
+    )}
+    </>
   )
 }

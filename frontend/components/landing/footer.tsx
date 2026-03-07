@@ -14,7 +14,6 @@ export function Footer() {
             <Link href="#features" className="text-sm text-muted-foreground hover:text-foreground">Features</Link>
             <Link href="#how-it-works" className="text-sm text-muted-foreground hover:text-foreground">How It Works</Link>
             <Link href="#integrations" className="text-sm text-muted-foreground hover:text-foreground">Integrations</Link>
-            <Link href="/dashboard" className="text-sm text-muted-foreground hover:text-foreground">Dashboard</Link>
           </nav>
           <p className="text-sm text-muted-foreground">
             {"© 2026 Petpooja Vani. All rights reserved."}
