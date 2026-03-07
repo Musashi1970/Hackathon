@@ -5,8 +5,8 @@ from supabase import create_client, Client
 # 1. Supabase Connection Setup
 # ---------------------------------------------------------
 SUPABASE_URL = "https://rlgerrarssaevbxqpxuz.supabase.co"
-SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJsZ2VycmFyc3NhZXZieHFweHV6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI3Mz" \
-"E1NjMsImV4cCI6MjA4ODMwNzU2M30.JAX0JUrH5oS2Fl4E53orZNJbxMdJ9Pv7CITJorP4-xM"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJsZ2VycmFyc3NhZXZieHFweHV6Iiwicm9sZSI6ImFub24iLCJpYXQiOj" \
+"E3NzI3MzE1NjMsImV4cCI6MjA4ODMwNzU2M30.JAX0JUrH5oS2Fl4E53orZNJbxMdJ9Pv7CITJorP4-xM"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def generate_optimized_menu_dataset():
@@ -17,7 +17,7 @@ def generate_optimized_menu_dataset():
     
     # Fetch all recipe mappings to calculate ingredient costs
     recipes_res = supabase.table('recipe_mapping') \
-        .select('menu_id, quantity_used, ingredients(unit_cost)') \
+        .select('menu_id, quantity_used, ingredients(price_per_unit)') \
         .execute()
         
     # Pre-calculate ingredient costs per menu_id
@@ -25,7 +25,7 @@ def generate_optimized_menu_dataset():
     for mapping in recipes_res.data:
         m_id = mapping['menu_id']
         qty = float(mapping['quantity_used'])
-        unit_cost = float(mapping['ingredients']['unit_cost'])
+        unit_cost = float(mapping['ingredients']['price_per_unit'])
         ingredient_costs[m_id] = ingredient_costs.get(m_id, 0.0) + (qty * unit_cost)
 
     dataset = []
@@ -112,7 +112,7 @@ def generate_optimized_menu_dataset():
     
     # Perform an upsert (Update if exists, Insert if new)
     try:
-        response = supabase.table('final_menu_prices').upsert(records_to_insert).execute()
+        response = supabase.table('final_menu_prices').upsert(records_to_insert, on_conflict='item_name').execute()
         print("✅ Database update successful!")
         
         # Print a clean table to the terminal for visual confirmation

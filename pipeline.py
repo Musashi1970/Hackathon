@@ -1,207 +1,293 @@
 """
-pipeline.py — Full voice ordering pipeline (STT → LLM → TTS with conversation memory)
-Low-latency, multi-turn voice ordering system for Mudigonda Sharma Cafe.
-Uses Sarvam AI for STT/TTS, Groq LLM for order processing and memory.
+pipeline.py — Mysore Cafe Voice Ordering Pipeline
+VAD-based recording (stops when you stop talking) + parallel LLM/TTS + interruptible playback
 """
-
-import os
-import sys
-import json
-import re
-import time
+import os, sys, json, wave, time, threading, io, struct
 import requests
 import sounddevice as sd
-import wave
-if sys.platform == "win32":
-    import winsound
-from main import groq_client, build_prompt, parse_response, SARVAM_KEY
+import webrtcvad
+import pygame
+from main import groq_client, build_prompt, parse_response, SARVAM_KEY, MENU, save_order, save_call_logs
 
 # ── Config ────────────────────────────────────────────────────────
-SAMPLE_RATE = 16000
-DURATION    = 5  # seconds to record
+SAMPLE_RATE     = 16000      # Sarvam needs 16kHz
+FRAME_MS        = 20         # VAD frame size in ms (10, 20, or 30)
+FRAME_SAMPLES   = int(SAMPLE_RATE * FRAME_MS / 1000)
+VAD_MODE        = 3          # 0-3, 3 is most aggressive
+SILENCE_FRAMES  = 30         # frames of silence before we stop (~600ms)
+MIN_SPEECH_FRAMES = 15       # need at least ~300ms of real speech
+MIN_RMS_ENERGY  = 300        # reject audio quieter than this (0-32768 scale)
+MAX_RECORD_S    = 12         # safety cap
+PRE_ROLL_FRAMES = 5          # frames to keep before speech starts
 
-conversation_history = []  # Stores full conversation for context
+conversation_history = []
 
 # ─────────────────────────────────────────────────────────────────
-# STEP 1 — STT: Record mic → text  (Sarvam Saarika)
+# 1. VAD RECORDING
 # ─────────────────────────────────────────────────────────────────
-def record_audio(filename="input.wav"):
-    print(f"\nRecording for {DURATION} seconds... Speak now!")
-    audio = sd.rec(int(DURATION * SAMPLE_RATE), samplerate=SAMPLE_RATE, channels=1, dtype='int16')
-    sd.wait()
+def record_until_silence(filename="input.wav") -> str:
+    """Record mic until the user stops talking. Returns filename."""
+    vad = webrtcvad.Vad(VAD_MODE)
+    
+    print("  Listening... (speak now, stops when you stop)")
+
+    ring_buf   = []        # pre-roll buffer
+    voiced_buf = []        # final audio frames
+    triggered  = False
+    silence_count = 0
+    total_frames  = 0
+    max_frames = int(MAX_RECORD_S * 1000 / FRAME_MS)
+
+    with sd.RawInputStream(samplerate=SAMPLE_RATE, channels=1, dtype='int16',
+                           blocksize=FRAME_SAMPLES) as stream:
+        while total_frames < max_frames:
+            raw, _ = stream.read(FRAME_SAMPLES)
+            frame = bytes(raw)
+            total_frames += 1
+
+            is_speech = vad.is_speech(frame, SAMPLE_RATE)
+
+            if not triggered:
+                ring_buf.append(frame)
+                if len(ring_buf) > PRE_ROLL_FRAMES:
+                    ring_buf.pop(0)
+                if is_speech:
+                    triggered = True
+                    voiced_buf.extend(ring_buf)
+                    ring_buf.clear()
+            else:
+                voiced_buf.append(frame)
+                if not is_speech:
+                    silence_count += 1
+                    if silence_count >= SILENCE_FRAMES:
+                        break
+                else:
+                    silence_count = 0
+
+    # Require minimum real speech frames to avoid sending noise to Sarvam
+    if len(voiced_buf) < MIN_SPEECH_FRAMES:
+        return ""
+
+    audio_bytes = b"".join(voiced_buf)
+
+    # RMS energy check — reject if audio is too quiet (STT hallucinates on near-silence)
+    samples = struct.unpack(f"{len(audio_bytes)//2}h", audio_bytes)
+    rms = (sum(s*s for s in samples) / len(samples)) ** 0.5
+    if rms < MIN_RMS_ENERGY:
+        return ""
+    # Pad to at least 1.5s so Sarvam doesn't reject short clips
+    min_bytes = int(SAMPLE_RATE * 1.5) * 2  # 16-bit mono
+    if len(audio_bytes) < min_bytes:
+        audio_bytes += b"\x00" * (min_bytes - len(audio_bytes))
 
     with wave.open(filename, 'wb') as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(audio.tobytes())
+        wf.writeframes(audio_bytes)
 
-    print(f"Recording saved: {filename}")
     return filename
 
-def transcribe_audio(filename="input.wav"):
-    print("Sending to Sarvam STT...")
+
+# ─────────────────────────────────────────────────────────────────
+# 2. STT
+# ─────────────────────────────────────────────────────────────────
+def transcribe(filename="input.wav") -> str:
     with open(filename, "rb") as f:
-        files    = {"file": (filename, f, "audio/wav")}
-        headers  = {"api-subscription-key": SARVAM_KEY}
-        data     = {"model": "saarika:v2.5", "language_code": "en-IN"}
-        response = requests.post(
+        files   = {"file": (filename, f, "audio/wav")}
+        headers = {"api-subscription-key": SARVAM_KEY}
+        data    = {"model": "saarika:v2.5", "language_code": "en-IN"}
+        r = requests.post(
             "https://api.sarvam.ai/speech-to-text",
             headers=headers, files=files, data=data, timeout=30,
         )
-        response.raise_for_status()
+        r.raise_for_status()
+    return r.json().get("transcript", "").strip()
 
-    transcript = response.json().get("transcript", "")
-    print(f"You said: {transcript}")
-    return transcript
 
 # ─────────────────────────────────────────────────────────────────
-# STEP 2 — LLM: text → AI reply  (Groq with conversation memory)
+# 3. LLM (streaming, low tokens)
 # ─────────────────────────────────────────────────────────────────
-def get_llm_response(user_text, system_prompt):
-    """Process user input with full conversation history for order management."""
-    print("🤖 Processing with LLM...")
-
-    # Add user message to history
-    conversation_history.append({"role": "user", "content": user_text})
-    
-    # Prepare messages: system prompt + full history
+def llm_reply(system_prompt) -> dict:
     messages = [{"role": "system", "content": system_prompt}] + conversation_history
-
-    # Call LLM with streaming (low latency)
-    start_time = time.time()
     completion = groq_client.chat.completions.create(
         model="openai/gpt-oss-120b",
         messages=messages,
-        temperature=1,
-        max_completion_tokens=2048,  # Optimized for faster responses
+        temperature=0.7,
+        max_completion_tokens=600,
         top_p=1,
         stream=True,
     )
-
-    full_reply = ""
+    full = ""
     for chunk in completion:
-        delta_content = chunk.choices[0].delta.content
-        if delta_content:
-            full_reply += delta_content
+        full += chunk.choices[0].delta.content or ""
+    return full
 
-    elapsed = time.time() - start_time
-    print(f"   ⚡ LLM response time: {elapsed:.2f}s")
-
-    # Add assistant response to history
-    conversation_history.append({"role": "assistant", "content": full_reply})
-
-    # Parse the structured response
-    data = parse_response(full_reply)
-    tts_message = data.get("tts_message", full_reply)
-    cart_status = data.get("cart_status", "shopping")
-    order_data = data.get("order_data", [])
-
-    # Display response details
-    print("\n" + "-" * 60)
-    print("  🧠 THOUGHT  :", data.get("thought_process", "-"))
-    print("  🗣️  SPEAK    :", tts_message[:100] + ("..." if len(tts_message) > 100 else ""))
-    print(f"  📍 STAGE    : {data.get('conversation_stage', '-')}  |  TONE: {data.get('ai_tone', '-')}")
-    
-    ca = data.get("customer_analysis", {})
-    print(f"  😊 MOOD     : {ca.get('sentiment', '-')}  |  RUSH: {ca.get('urgency', '-')}")
-    
-    if order_data:
-        items_str = ", ".join(f"{i.get('item_code')} x{i.get('qty')}" for i in order_data)
-        print(f"  🛒 CART     : {items_str}")
-    
-    print(f"  ✅ STATUS   : {data.get('cart_status', '-')}")
-    print("-" * 60)
-
-    return tts_message, cart_status, order_data, data
 
 # ─────────────────────────────────────────────────────────────────
-# STEP 3 — TTS: AI reply → speech  (Sarvam with low-latency playback)
+# 4. TTS (Sarvam)
 # ─────────────────────────────────────────────────────────────────
-def speak(text, filename="output.mp3"):
-    """Convert text to speech and play immediately."""
-    print("🔊 Converting to speech...")
-    
-    start_time = time.time()
-    headers = {
-        "api-subscription-key": SARVAM_KEY,
-        "Content-Type": "application/json",
-    }
+def tts_to_bytes(text: str) -> bytes:
+    headers = {"api-subscription-key": SARVAM_KEY, "Content-Type": "application/json"}
     payload = {
         "text": text,
         "target_language_code": "en-IN",
-        "speaker": "anushka",  # Use anushka for warm voice
-        "model": "bulbul:v2",
-        "pace": 1.0,
+        "speaker": "shubh",
+        "model": "bulbul:v3",
+        "pace": 1.1,
         "speech_sample_rate": 22050,
         "output_audio_codec": "mp3",
         "enable_preprocessing": True,
     }
-
-    with requests.post(
+    r = requests.post(
         "https://api.sarvam.ai/text-to-speech/stream",
         headers=headers, json=payload, stream=True, timeout=30,
-    ) as response:
-        response.raise_for_status()
-        with open(filename, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
+    )
+    r.raise_for_status()
+    buf = b""
+    for chunk in r.iter_content(8192):
+        if chunk:
+            buf += chunk
+    return buf
 
-    elapsed = time.time() - start_time
-    print(f"   ⚡ TTS generation time: {elapsed:.2f}s")
-    print(f"   ✓ Audio ready: {filename}")
-
-    # Play audio based on OS (blocking call)
-    if sys.platform == "darwin":
-        os.system(f"afplay {filename}")
-    elif sys.platform == "win32":
-        # Windows: use default player (silent mode for minimal latency)
-        os.system(f"start /wait {filename}")
-    else:
-        # Linux: mpg123 for quick playback
-        os.system(f"mpg123 -q {filename} 2>/dev/null || ffplay -nodisp -autoexit {filename}")
 
 # ─────────────────────────────────────────────────────────────────
-# MAIN PIPELINE (Multi-turn voice ordering)
+# 5. PLAYBACK (pygame)
+# ─────────────────────────────────────────────────────────────────
+_pygame_init_done = False
+
+def play_audio(audio_bytes: bytes):
+    """Play MP3 bytes via pygame, blocking until done."""
+    global _pygame_init_done
+    if not _pygame_init_done:
+        pygame.mixer.init(frequency=22050)
+        _pygame_init_done = True
+
+    buf = io.BytesIO(audio_bytes)
+    pygame.mixer.music.load(buf, "mp3")
+    pygame.mixer.music.play()
+
+    while pygame.mixer.music.get_busy():
+        time.sleep(0.05)
+
+
+# ─────────────────────────────────────────────────────────────────
+# 6. CALC TOTAL
+# ─────────────────────────────────────────────────────────────────
+def calc_total(items):
+    return sum(
+        MENU.get(i.get("item_code"), {}).get("price", 0) * i.get("qty", 0)
+        for i in items
+    )
+
+
+# ─────────────────────────────────────────────────────────────────
+# MAIN PIPELINE
 # ─────────────────────────────────────────────────────────────────
 def run_pipeline():
-    """Multi-turn voice ordering: listen → LLM → speak → repeat until order closed"""
-    print("\n" + "=" * 60)
-    print("  Mudigonda Sharma Cafe — Voice Ordering Pipeline")
-    print("  Live STT → LLM → TTS with minimal latency")
-    print("=" * 60)
+    print("\n" + "=" * 50)
+    print("  Mysore Cafe — Voice Ordering")
+    print("  Say 'quit' to exit anytime")
+    print("=" * 50)
 
     conversation_history.clear()
     system_prompt = build_prompt()
+    order_id = "ORD-" + __import__("uuid").uuid4().hex[:6].upper()
+    special_requests_acc = []  # accumulate special requests across turns, save at end
+
+    # Hardcoded greeting — no LLM call, instant start
+    greeting = "Vanakkam, this is Mysore Cafe. Arjun speaking. How may I help you?"
+    conversation_history.append({"role": "assistant", "content": '{"tts_message": "' + greeting + '", "cart_status": "shopping", "order_data": []}'})
+    print(f"\nArjun: {greeting}")
+
+    audio = tts_to_bytes(greeting)
+    play_audio(audio)
+    time.sleep(0.5)  # brief pause before mic opens
 
     while True:
-        # Step 1: Record customer speech
-        audio_file = record_audio()
-        transcript = transcribe_audio(audio_file)
-
-        if not transcript.strip():
-            print("❌ Could not understand. Please try again.\n")
+        # Record with VAD
+        wav_file = record_until_silence()
+        if not wav_file:
             continue
 
-        print(f"✓ Recognized: '{transcript}'\n")
+        # STT
+        transcript = transcribe(wav_file)
+        if not transcript:
+            continue
 
-        # Step 2: Process with LLM + Step 3: Convert to speech
-        tts_message, cart_status, order_data, full_data = get_llm_response(transcript, system_prompt)
-        
-        # Step 4: Play audio response
-        speak(tts_message)
+        print(f"\nYou: {transcript}")
 
-        # Check if order is complete
-        if cart_status == "closed":
-            print("\n" + "=" * 60)
-            print("  ✅ ORDER CONFIRMED & CLOSED!")
-            print("=" * 60)
-            print(f"Order ID: {full_data.get('order_id', 'N/A')}")
-            print(f"Items: {json.dumps(order_data, indent=2, ensure_ascii=False)}")
-            print(f"Total: Rs.{full_data.get('order_total', 0)}")
-            print("=" * 60 + "\n")
+        if transcript.lower() in ("quit", "exit", "bye"):
+            print("Goodbye!")
             break
+
+        conversation_history.append({"role": "user", "content": transcript})
+
+        # LLM then TTS
+        llm_result = {}
+        tts_audio   = {}
+
+        def run_tts_after_llm():
+            raw = llm_reply(system_prompt)
+            conversation_history.append({"role": "assistant", "content": raw})
+            llm_result["raw"] = raw
+            d = parse_response(raw)
+            llm_result["data"] = d
+            msg = d.get("tts_message", "")
+            if msg:
+                tts_audio["bytes"] = tts_to_bytes(msg)
+
+        t = threading.Thread(target=run_tts_after_llm, daemon=True)
+        t.start()
+        t.join()
+
+        data = llm_result.get("data", {})
+        tts_msg     = data.get("tts_message", "")
+        cart_status = data.get("cart_status", "shopping")
+        order_data  = data.get("order_data", [])
+        sr = data.get("special_requests")
+        if sr:
+            special_requests_acc.append(sr)
+
+        # Enrich with names + prices
+        enriched = []
+        for item in order_data:
+            code = item.get("item_code", "")
+            m = MENU.get(code, {})
+            enriched.append({**item, "name": m.get("name", code), "price": m.get("price", 0)})
+        total = calc_total(enriched)
+
+        if not tts_msg:
+            continue
+        print(f"\nArjun: {tts_msg}")
+        if enriched:
+            cart_str = ", ".join(f"{i['name']} x{i['qty']} Rs.{i['price']}" for i in enriched)
+            print(f"  Cart: {cart_str}  |  Total: Rs.{total}")
+
+        if tts_audio.get("bytes"):
+            play_audio(tts_audio["bytes"])
+            time.sleep(0.5)  # brief pause before mic opens
+
+        if cart_status == "closed":
+            print("\n" + "=" * 50)
+            print("  ORDER PLACED!")
+            print("=" * 50)
+            for item in enriched:
+                print(f"  {item['name']} x{item['qty']}  Rs.{item['price'] * item['qty']}")
+            print(f"  Total: Rs.{total}")
+            print("=" * 50)
+            # Save to Supabase
+            save_order({
+                "order_id":         order_id,
+                "items":            enriched,
+                "total":            total,
+                "delivery_type":    data.get("delivery_type"),
+                "special_requests": ", ".join(special_requests_acc) or None,
+                "rating":           data.get("customer_rating"),
+            })
+            save_call_logs(order_id, conversation_history)
+            break
+
 
 if __name__ == "__main__":
     run_pipeline()
